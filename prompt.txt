@@ -1,0 +1,162 @@
+You are refactoring an existing automated SMC (Smart Money Concepts) trading bot 
+into a signal notifier. The bot is in Python, connects to MT5, and uses APScheduler.
+
+## REPOSITORY
+Work inside the existing `smc_bot-master` repository. Do NOT create a new repo.
+Create a new branch: `feature/telegram-notifier`
+
+## GOAL
+Transform the bot from fully automated trading into a signal advisor:
+- Keep all SMC analysis logic intact (core/, data/, broker/connector.py)
+- Remove all order execution
+- Add Telegram bot integration for trade signals
+- Simplify the dashboard config panel
+
+---
+
+## CHANGES REQUIRED
+
+### 1. REMOVE — Order Execution
+- `broker/order_manager.py`: remove all order-placing methods:
+  place_market_order(), place_limit_order(), close_position(), close_partial()
+  Keep ONLY: get_open_positions(), get_today_closed_trades(), has_open_exposure()
+  (these are still used for daily stats display in dashboard)
+- `broker/risk_manager.py`: remove manage_open_trades(), _manage_single_trade(),
+  _should_partial_close_on_weakness(), and all partial_close / trailing_stop logic.
+  Keep: calculate_lot_size(), get_daily_stats(), is_daily_limit_reached()
+- `main.py`: remove manage_trades() job from APScheduler
+  Remove friday_close() job and function
+  Remove sync_trades_with_mt5() job and function
+  Remove all calls to order_mgr.place_market_order() and place_limit_order()
+
+### 2. REMOVE — Limit Order / Pending Intent execution
+- In `main.py` _analyze_single_symbol(): when a signal is found, do NOT place any
+  order. Instead, call the new Telegram notifier (see section 4).
+- Keep PendingIntent logic fully intact (engine.check_intent, engine.try_create_intent)
+  — the bot still needs to detect when entry conditions are met.
+- Only send Telegram signal when signal.setup_score >= config.min_setup_score
+  (same threshold as before, just notify instead of execute)
+
+### 3. SIGNAL DEDUPLICATION
+Add a simple in-memory dict: `notified_signals: dict[str, str]`
+Key = symbol, Value = signal direction + entry_price rounded to 5 decimal places
+  (e.g. "buy_1.08523")
+
+Logic in _analyze_single_symbol():
+- When a signal fires: check if notified_signals[symbol] == current signal key
+  - If YES and user has NOT acknowledged → re-send only if last_sent_time > 5 minutes ago
+  - If YES and user HAS acknowledged (placed order) → skip, do not re-send
+  - If NO (new signal) → send Telegram message, store in notified_signals
+- When signal disappears (no signal on scan) → clear notified_signals[symbol]
+  and reset acknowledgement
+
+Acknowledgement mechanism:
+- Telegram inline keyboard button under each signal: "✅ Order Placed"
+- When user taps it → bot receives callback, marks that symbol as acknowledged
+  Store in: `acknowledged_signals: dict[str, str]` (symbol → signal_key)
+- Add /status command: shows all active signals and which ones are acknowledged
+
+### 4. NEW FILE — `telegram_notifier.py`
+Create this file in the root of the project.
+
+Class TelegramNotifier:
+  - __init__(token, chat_id): store token and chat_id
+  - send_signal(signal, lot, estimated_hours): sends formatted message with inline button
+  - handle_callback(callback_query): processes "Order Placed" button taps
+  - start_polling(): starts async polling in a background thread
+  - /status command handler: shows current active signals
+
+Signal message format:
+🟢 EURUSD BUY   (or 🔴 for SELL)
+━━━━━━━━━━━━━━
+📦 Lot Size:  0.10
+🎯 Entry:     1.08523
+🛑 Stop Loss: 1.08250  (-27 pips)
+✅ Take Profit: 1.09100  (+57 pips)
+📊 RR Ratio:  1:2.4
+⭐ Score:      78/100
+⏱ Est. hold:  ~3-5 hours
+📍 Session:   New York
+━━━━━━━━━━━━━━
+[✅ Order Placed]
+Estimated hold time logic (heuristic based on session + RR):
+- Asian session: RR * 3 hours (slow session)
+- London session: RR * 1.5 hours
+- New York session: RR * 2 hours
+- London Close: RR * 1 hour
+- Default: RR * 2 hours
+- Round to nearest 0.5h, format as range ±0.5h
+  Example: RR=2.4, NY → 4.8h → "~4.5-5 hours"
+
+Use python-telegram-bot library (v20+, async).
+
+### 5. CONFIG CHANGES — `config.py`
+Add new fields to BotConfig:
+  telegram_token: str = ""
+  telegram_chat_id: str = ""
+  scan_interval_seconds: int = 300  (change default from 30 to 300)
+
+Remove from BotConfig (or mark as unused, do not show in dashboard):
+  partial_close_enabled, partial_close_at_rr, partial_close_pct,
+  partial_close_pullback_rr, partial_close_target_proximity_rr,
+  partial_close_structure_bars, trailing_stop_enabled, trailing_stop_atr_mult,
+  update_interval_seconds (trade manager interval, no longer needed)
+
+### 6. DASHBOARD CHANGES — `dashboard/`
+
+Config panel — keep ONLY these settings visible:
+  • Active Symbols (multi-select)
+  • Min Setup Score (slider 0-100)
+  • Minimum RR Ratio (input, default 1.5)
+  • Risk per Trade % (input, used for lot size calculation in signal)
+  • Max Daily Trades (input)
+  • Daily Drawdown Limit % (input)
+  • Session filters: London KZ, New York KZ, Asian KZ, London Close (checkboxes)
+  • Telegram Token (text input, masked)
+  • Telegram Chat ID (text input)
+  • Scan Interval (seconds, default 300)
+
+Remove from config panel:
+  ATR-related settings, partial close settings, trailing stop settings,
+  algo trading toggle, update interval, broker-specific fields,
+  anything related to order execution
+
+Signals display panel — add a new column: "Acknowledged" (✅ or ⏳)
+  showing whether user tapped "Order Placed" for that signal
+
+### 7. MAIN.PY — Integration
+In _analyze_single_symbol(), after signal quality check, replace order execution with:
+  notifier = bot_state["notifier"]
+  if notifier:
+      signal_key = f"{signal.direction}_{round(signal.entry_price, 5)}"
+      already_acked = bot_state["acknowledged_signals"].get(base_symbol) == signal_key
+      if not already_acked:
+          lot = risk_mgr.calculate_lot_size(mt5_symbol, sl_pips, config.risk_per_trade_pct)
+          estimated_hours = notifier.estimate_hold_time(signal.session, signal.rr_ratio)
+          notifier.send_signal(signal, lot, estimated_hours)
+          bot_state["notified_signals"][base_symbol] = signal_key
+
+Add to bot_state:
+  "notifier": None
+  "notified_signals": {}
+  "acknowledged_signals": {}
+
+In main():
+  Initialize TelegramNotifier if config.telegram_token and config.telegram_chat_id are set
+  Start its polling thread
+  Store in bot_state["notifier"]
+
+### 8. REQUIREMENTS
+Add to requirements.txt:
+  python-telegram-bot>=20.0
+
+---
+
+## CONSTRAINTS
+- Do NOT touch: core/, data/fetcher.py, data/database.py, broker/connector.py,
+  utils/, core/entry_engine.py — zero changes to analysis logic
+- Preserve all existing logging
+- Keep the Dash dashboard fully functional
+- All new code must handle exceptions gracefully (no crashes on Telegram errors)
+- The bot must still work even if Telegram is not configured
+  (notifier = None, bot runs silently like before)
