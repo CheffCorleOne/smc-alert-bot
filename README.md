@@ -1,60 +1,48 @@
-# Institutional SMC Trading Bot
+# SMC Signal Notifier
 
-Automated Smart Money Concepts (ICT/SMC) trading bot for MetaTrader 5 with a real-time Dash dashboard, pending setup memory, structural risk checks, and automated position management.
+Smart Money Concepts (ICT/SMC) signal notifier for MetaTrader 5.
 
-The bot is designed for Windows with an open, logged-in MT5 terminal. The default broker profile targets Libertex-style MT5 symbols, but symbols can be mapped in `BotConfig`.
+The bot connects to a running MT5 terminal, scans selected instruments with the existing SMC analysis engine, and sends qualified trade ideas to Telegram. It does not place, close, or modify orders. Order execution is manual.
 
-## Key Features
+## What It Does
 
-### Thinking Bot Architecture
+- Connects to MetaTrader 5 for market data, account info, and open-position stats.
+- Runs the existing 9-step SMC analysis pipeline.
+- Keeps PendingIntent memory for partially formed setups.
+- Filters setups by enabled killzones, minimum setup score, minimum RR, daily limits, and session rules.
+- Calculates an advisory lot size from account balance, SL distance, and configured risk percent.
+- Sends Telegram messages with entry, SL, TP, RR, score, session, lot size, and estimated hold time.
+- Lets you mark a signal as handled with the Telegram inline button `Order Placed`.
+- Shows active signals and acknowledgement status in the Dash dashboard.
 
-The bot does not forget a setup just because one confirmation is missing. When HTF bias and liquidity context are present but price has not returned to the POI yet, it creates a `PendingIntent`. The dashboard shows the setup phase as it progresses from watching to ready, armed, and triggered.
+## What It Does Not Do
 
-### Structural SMC Execution
+- It does not place market orders.
+- It does not place limit orders.
+- It does not close positions.
+- It does not partial close.
+- It does not trail stop loss.
+- It does not need MT5 Algo Trading enabled for execution.
 
-- HTF bias from W1, D1, and H4 structure.
-- Liquidity targets from Asian range, equal highs/lows, and higher-timeframe pools.
-- POI detection from order blocks, fair value gaps, breaker blocks, and mitigation blocks.
-- Entry confirmation through CHoCH/BOS and optional limit-order intent entries.
-- Stop loss is structural: beyond the POI boundary with an ATR buffer.
-- If the structural SL is closer than the broker `stops_level`, the trade is rejected instead of widening the SL.
-- Take profit must be structural. If no liquidity target exists, the engine searches H4/D1 swing structure; if no target is found, the trade is skipped.
-
-### Risk And Position Management
-
-- Lot size uses MT5 tick value/tick size and rounds down to the broker volume step.
-- Original SL distance is stored in order comments as `|SLxx|` for later risk tracking.
-- `partial_close_at_rr` is the point where the bot starts watching for weakness, not an automatic exit.
-- Partial close only happens if the original idea weakens: M5/M15 protected swing break, opposite CHoCH, adverse M5 momentum after a pullback from max RR, or rejection near TP.
-- Trailing stop activates only after partial close and uses H1 ATR distance (`trailing_stop_atr_mult * ATR`).
-- Daily drawdown, max trades per day, max spread, and stale-position expiry are enforced.
-
-### Dashboard
-
-- Live Plotly charts with SMC overlays.
-- Bot state, open positions, statistics, and logs.
-- Settings for risk, RR, partial-close weakness rules, killzones, symbol selection, late entries, and symbol auto-loading.
-- Manual daily stats reset without deleting history.
-
-## Setup
-
-Requirements:
+## Requirements
 
 - Windows 10/11
 - Python 3.11+
 - MetaTrader 5 installed, open, and logged in
-- MT5 algorithmic trading enabled: `Tools -> Options -> Expert Advisors -> Allow algorithmic trading`
+- A Telegram bot token from BotFather
+- A Telegram chat ID for the chat that should receive signals
 
 Install dependencies:
 
-```bash
-pip install -r requirements.txt
+```powershell
+cd "C:\Users\temir\Desktop\SMC ALERT BOT"
+py -m pip install -r requirements.txt
 ```
 
-Run the bot:
+Run:
 
-```bash
-python main.py
+```powershell
+py main.py
 ```
 
 Open the dashboard:
@@ -63,24 +51,150 @@ Open the dashboard:
 http://localhost:8050
 ```
 
+## First-Time Setup
+
+1. Start MetaTrader 5 and log in.
+2. Make sure the symbols you want are visible in Market Watch.
+3. Start the bot with `py main.py`.
+4. Open `http://localhost:8050`.
+5. Go to `Settings`.
+6. Configure:
+   - Active Symbols
+   - Min Setup Score
+   - Minimum RR Ratio
+   - Risk per Trade %
+   - Max Daily Trades
+   - Daily Drawdown Limit %
+   - Session Filters
+   - Telegram Token
+   - Telegram Chat ID
+   - Scan Interval
+7. Click `Save Settings`.
+
+The bot starts scanning automatically after launch. The `Start Bot` button is only needed if you previously clicked `Stop Bot`.
+
+## Telegram Setup
+
+Create a bot:
+
+1. Open `@BotFather` in Telegram.
+2. Run `/newbot`.
+3. Copy the token.
+4. Send any message to your new bot.
+5. Open this URL in a browser, replacing `TOKEN`:
+
+```text
+https://api.telegram.org/botTOKEN/getUpdates
+```
+
+Find:
+
+```json
+"chat":{"id":123456789}
+```
+
+Use that number as `Telegram Chat ID`.
+
+Never commit your Telegram token to GitHub.
+
+## How To Know It Is Working
+
+In the terminal you should see:
+
+```text
+MT5 connection established
+Dashboard server started on http://localhost:8050
+Scheduler started (scanner: 30s)
+Market Signal Scan Start
+Scan complete
+```
+
+In the dashboard:
+
+- Connection should show `Connected`.
+- Active symbols should be listed.
+- `Analysis Status` should update every scan.
+- `Signal Analysis` should show active signals when they exist.
+
+In Telegram:
+
+```text
+/status
+```
+
+If Telegram is connected, the bot replies with active signals or `No active signals.`
+
 ## Analysis Pipeline
 
-1. HTF bias: determine directional context from W1, D1, and H4.
-2. Liquidity target: locate higher-timeframe and session liquidity pools.
-3. Liquidity sweep: confirm stops were swept.
-4. Structure shift: require CHoCH/BOS confirmation.
-5. POI entry zone: select OB/FVG/breaker/mitigation zones in premium or discount.
-6. Session filter: enforce enabled killzones and Silver Bullet windows.
-7. Confirmation or pending intent: wait for POI tap, confirmation, or eligible limit entry.
-8. Risk/reward: calculate structural SL and structural TP, reject weak RR or broker-invalid stops.
-9. Execution: check limits, calculate lot size, place order, and manage the position.
+1. HTF bias: W1, D1, and H4 directional context.
+2. Liquidity target: Asian range, EQH/EQL, or HTF pools.
+3. Sweep: valid liquidity sweep confirmation.
+4. Structure shift: CHoCH/BOS after sweep.
+5. POI: OB/FVG/breaker/mitigation zone.
+6. Session filter: enabled killzones and Silver Bullet logic.
+7. Confirmation or intent: POI tap, confirmation, or PendingIntent continuation.
+8. Risk/reward: structural SL and structural TP, with minimum RR check.
+9. Signal: log setup, calculate advisory lot size, and notify Telegram.
+
+There is no maximum RR cap. RR is calculated from the structural entry, stop loss, and take profit found during analysis.
+
+## Dashboard Settings
+
+Visible settings are intentionally limited to signal-advisor controls:
+
+- Active Symbols
+- Min Setup Score
+- Minimum RR Ratio
+- Risk per Trade %
+- Max Daily Trades
+- Daily Drawdown Limit %
+- Session Filters
+- Telegram Token
+- Telegram Chat ID
+- Scan Interval
+
+Advanced analysis parameters still live in `config.py`, but they are not exposed in the simplified dashboard.
+
+## Local Data And Secrets
+
+Runtime settings are stored locally in:
+
+```text
+data/bot_data.db
+```
+
+This file can contain Telegram credentials. It is ignored by `.gitignore` and should not be committed to GitHub.
+
+On a new laptop, the bot creates a fresh `data/bot_data.db` automatically on first run. You will need to enter dashboard settings again.
+
+## Move To Another Laptop
+
+1. Copy or clone the project.
+2. Install Python and MetaTrader 5.
+3. Install dependencies:
+
+```powershell
+py -m pip install -r requirements.txt
+```
+
+4. Start MT5 and log in.
+5. Run:
+
+```powershell
+py main.py
+```
+
+6. Open the dashboard and enter the same Telegram token and chat ID.
+
+Use only one running copy at a time if you want to avoid duplicate Telegram signals.
 
 ## Project Structure
 
 ```text
-smc_bot/
-|-- main.py                    # Entry point and scanner loop
+SMC ALERT BOT/
+|-- main.py                    # Entry point, scheduler, scanner, Telegram integration
 |-- config.py                  # BotConfig, symbol mapping, pip-size helpers
+|-- telegram_notifier.py       # Telegram signal sender, polling, acknowledgements
 |-- core/
 |   |-- entry_engine.py        # 9-step SMC analysis pipeline
 |   |-- pending_intent.py      # Setup memory and phase tracking
@@ -90,15 +204,15 @@ smc_bot/
 |   |-- sessions.py            # Killzone/session logic
 |-- broker/
 |   |-- connector.py           # MT5 connection and symbol discovery
-|   |-- order_manager.py       # Market/limit orders and trade modification
-|   |-- risk_manager.py        # Lot sizing, partial close, ATR trailing
+|   |-- order_manager.py       # Read-only exposure/history helpers
+|   |-- risk_manager.py        # Lot sizing and daily statistics/limits
 |-- dashboard/
 |   |-- app.py                 # Dash app creation
 |   |-- layout.py              # Dashboard layout and settings controls
 |   |-- callbacks.py           # Dashboard callbacks
 |   |-- charts.py              # Plotly chart rendering
 |-- data/
-|   |-- database.py            # Settings, logs, and trade history
+|   |-- database.py            # Settings, logs, signal/trade history
 |   |-- fetcher.py             # Market data fetching
 |-- utils/
 |   |-- logger.py              # Logging helpers
@@ -106,18 +220,30 @@ smc_bot/
 |   |-- config_snapshot.py     # Runtime config logging
 ```
 
-## Important Defaults
+## GitHub Safety Checklist
 
-- `risk_per_trade_pct`: `1.0`
-- `min_rr`: `2.0`
-- `partial_close_at_rr`: `2.0` start watching for weakness
-- `partial_close_pullback_rr`: `0.6`
-- `partial_close_target_proximity_rr`: `0.5`
-- `partial_close_pct`: `50.0`
-- `trailing_stop_enabled`: `True`
-- `trailing_stop_atr_mult`: `1.5`
-- `position_max_age_hours`: `8.0`
+Before pushing:
+
+```powershell
+git status
+```
+
+Do not commit:
+
+- `data/bot_data.db`
+- `.env`
+- `.venv/`
+- `__pycache__/`
+- log files
+- Telegram tokens
+
+If `data/bot_data.db` was added by mistake:
+
+```powershell
+git rm --cached data/bot_data.db
+git commit -m "Remove local database from repo"
+```
 
 ## Disclaimer
 
-This project is for education and research. Trading involves substantial risk of loss. Test on a demo account first, verify broker symbol settings, and do not assume past performance predicts future results.
+This project is for education and research. Trading involves substantial risk of loss. Test on a demo account first, verify broker symbol settings, and make all trading decisions yourself.
