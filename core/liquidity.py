@@ -6,16 +6,19 @@ and identifies liquidity sweeps by institutional players.
 """
 
 from dataclasses import dataclass
-from datetime import datetime, timezone, time as dt_time
+from datetime import datetime, time as dt_time
 from typing import List, Optional, Dict
+from zoneinfo import ZoneInfo
 
 import pandas as pd
-import numpy as np
 
 from config import get_pip_size
+from utils.indicators import atr as _atr
 from utils.logger import get_logger
 
 logger = get_logger("liquidity")
+
+NY_TZ = ZoneInfo("America/New_York")
 
 
 # ── Data Structures ──────────────────────────────────────────
@@ -361,18 +364,8 @@ class LiquidityEngine:
 
     @staticmethod
     def _calculate_atr(df: pd.DataFrame, period: int = 14) -> float:
-        if df is None or len(df) < period + 1:
-            return 0.0
-        high = df["high"]
-        low = df["low"]
-        close_prev = df["close"].shift(1)
-        tr = pd.concat([
-            high - low,
-            (high - close_prev).abs(),
-            (low - close_prev).abs(),
-        ], axis=1).max(axis=1)
-        atr = tr.rolling(window=period).mean()
-        return float(atr.iloc[-1]) if not pd.isna(atr.iloc[-1]) else 0.0
+        """Delegates to the shared indicator (kept for call-site compatibility)."""
+        return _atr(df, period)
 
     def is_liquidity_swept(
         self, df: pd.DataFrame, level: float, lookback: int = 5
@@ -395,16 +388,21 @@ class LiquidityEngine:
     @staticmethod
     def get_asian_range(df_h1: pd.DataFrame) -> Optional[Dict]:
         """
-        Calculate the Asian session range using ICT methodology.
+        Calculate the most recent COMPLETED Asian session range (ICT), DST-aware.
 
-        ICT defines the Asian Range as 19:00–00:00 EST = 00:00–05:00 UTC.
-        The Midnight Open (00:00 EST = 05:00 UTC) is the daily price anchor.
+        ICT defines the Asian Range as 19:00–00:00 New York time, with the
+        Midnight Open (00:00 NY) as the daily price anchor. Because NY observes
+        daylight saving, this window is computed in America/New_York rather than
+        a fixed UTC offset (the old code hard-coded 00:00–05:00 UTC, which was
+        only correct in winter).
 
-        Also detects whether each level has been swept post-accumulation
-        (i.e., during London or NY sessions).
+        We anchor on the most recent NY midnight at/just before the last bar:
+          - Asian range  = candles in [midnight − 5h, midnight)  (19:00→00:00 NY)
+          - Midnight Open = open of the 00:00 NY candle
+          - Sweeps        = detected on candles at/after that midnight
 
         Args:
-            df_h1: H1 OHLCV DataFrame with UTC timestamps.
+            df_h1: H1 OHLCV DataFrame with tz-aware UTC timestamps.
 
         Returns:
             Dict with high, low, mid, midnight_open, sweep status, or None.
@@ -414,67 +412,41 @@ class LiquidityEngine:
 
         try:
             df = df_h1.copy()
-            df["hour"] = df["time"].dt.hour
-            df["date"] = df["time"].dt.date
+            ny = df["time"].dt.tz_convert(NY_TZ)
+            last_ny = ny.iloc[-1]
 
-            latest_date = df["date"].iloc[-1]
+            # Most recent NY midnight at/before the last bar.
+            midnight = pd.Timestamp(
+                datetime.combine(last_ny.date(), dt_time(0, 0)), tz=NY_TZ
+            )
+            asian_start = midnight - pd.Timedelta(hours=5)  # 19:00 NY prev evening
 
-            # ICT Asian Range: 00:00–05:00 UTC (19:00–00:00 EST)
-            asian = df[
-                (df["date"] == latest_date) &
-                (df["hour"] >= 0) &
-                (df["hour"] < 5)
-            ]
-
-            # Fallback to previous day if today's range hasn't formed
+            asian = df[(ny >= asian_start) & (ny < midnight)]
             if asian.empty or len(asian) < 2:
-                prev_dates = df["date"].unique()
-                if len(prev_dates) >= 2:
-                    prev = prev_dates[-2]
-                    asian = df[
-                        (df["date"] == prev) &
-                        (df["hour"] >= 0) &
-                        (df["hour"] < 5)
-                    ]
-                    latest_date = prev
-
-            if asian.empty:
                 return None
 
             high = float(asian["high"].max())
             low = float(asian["low"].min())
             mid = round((high + low) / 2, 5)
 
-            # Midnight Open: the open of the 05:00 UTC candle (00:00 EST)
-            midnight_candle = df[
-                (df["date"] == latest_date) &
-                (df["hour"] == 5)
-            ]
-            if midnight_candle.empty:
-                # Fallback: use the close of the last Asian candle
+            # Midnight Open: open of the 00:00 NY candle (first bar at/after it).
+            mo_candle = df[ny >= midnight]
+            if mo_candle.empty:
                 midnight_open = float(asian["close"].iloc[-1])
             else:
-                midnight_open = float(midnight_candle["open"].iloc[0])
+                midnight_open = float(mo_candle["open"].iloc[0])
 
-            # Detect sweeps: check candles AFTER 05:00 UTC on the same date
-            post_asian = df[
-                (df["date"] == latest_date) &
-                (df["hour"] >= 5)
-            ]
-
+            # Sweeps post-accumulation: candles at/after the midnight open.
+            post_asian = df[ny >= midnight]
             high_swept = False
             low_swept = False
-
             if not post_asian.empty:
                 pa_highs = post_asian["high"].values
                 pa_lows = post_asian["low"].values
                 pa_closes = post_asian["close"].values
-
                 for i in range(len(post_asian)):
-                    # Asian High swept: wick above + close below
                     if pa_highs[i] > high and pa_closes[i] < high:
                         high_swept = True
-                    # Asian Low swept: wick below + close above
                     if pa_lows[i] < low and pa_closes[i] > low:
                         low_swept = True
 
@@ -485,7 +457,7 @@ class LiquidityEngine:
                 "midnight_open": midnight_open,
                 "high_swept": high_swept,
                 "low_swept": low_swept,
-                "date": latest_date,
+                "date": midnight.date(),
             }
 
         except Exception as exc:

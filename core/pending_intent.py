@@ -15,8 +15,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, List, Any
 import threading
-import json
 
+from broker.mt5_client import get_mt5
 from utils.logger import get_logger
 
 logger = get_logger("intent")
@@ -25,7 +25,7 @@ logger = get_logger("intent")
 def _cancel_mt5_limit_order(ticket: int) -> bool:
     """Send trade request directly to MT5 to delete a pending limit order."""
     try:
-        import MetaTrader5 as mt5
+        mt5 = get_mt5()
         # Check if connected/initialized
         if mt5.terminal_info() is None:
             if not mt5.initialize():
@@ -161,6 +161,33 @@ class PendingIntent:
             parts.append(f"📍 Limit #{self.limit_ticket} @ {self.limit_entry}")
 
         self.narrative = " → ".join(parts)
+
+    # ── Persistence ──────────────────────────────────────────
+    _STATE_FIELDS = (
+        "symbol", "direction", "htf_bias", "narrative", "phase",
+        "waiting_for", "waiting_detail", "liquidity_target", "liquidity_type",
+        "sweep_level", "choch_direction", "poi_top", "poi_bottom", "poi_type",
+        "limit_entry", "limit_sl", "limit_tp", "limit_ticket",
+    )
+
+    def to_state_dict(self) -> Dict[str, Any]:
+        """Serialise the intent so it survives a process restart."""
+        state = {f: getattr(self, f) for f in self._STATE_FIELDS}
+        state["created_at"] = self.created_at.isoformat()
+        state["expires_at"] = self.expires_at.isoformat() if self.expires_at else None
+        return state
+
+    @classmethod
+    def from_state_dict(cls, state: Dict[str, Any]) -> "PendingIntent":
+        """Rebuild an intent from ``to_state_dict`` output."""
+        kwargs = {f: state.get(f) for f in cls._STATE_FIELDS if state.get(f) is not None}
+        intent = cls(**kwargs)
+        created = state.get("created_at")
+        expires = state.get("expires_at")
+        if created:
+            intent.created_at = datetime.fromisoformat(created)
+        intent.expires_at = datetime.fromisoformat(expires) if expires else None
+        return intent
 
     def to_dashboard_dict(self) -> Dict[str, Any]:
         """Serialize for dashboard display."""
@@ -356,7 +383,7 @@ class IntentManager:
         # Check MT5 pending order status if limit ticket exists
         if intent.limit_ticket is not None:
             try:
-                import MetaTrader5 as mt5
+                mt5 = get_mt5()
                 # Ensure mt5 is initialized
                 if mt5.terminal_info() is not None or mt5.initialize():
                     # Check if the pending order still exists in MT5
@@ -417,6 +444,39 @@ class IntentManager:
             "total_active": len(active),
             "recent_history": self._history[-10:],
         }
+
+    # ── Persistence ──────────────────────────────────────────
+
+    def export_state(self) -> List[Dict[str, Any]]:
+        """Snapshot all active intents for saving to disk."""
+        with self._lock:
+            return [
+                intent.to_state_dict()
+                for intent in self._intents.values()
+                if intent.is_active()
+            ]
+
+    def import_state(self, states: List[Dict[str, Any]]) -> int:
+        """Restore intents from a snapshot. Skips expired ones. Returns count."""
+        if not states:
+            return 0
+        restored = 0
+        with self._lock:
+            for state in states:
+                try:
+                    intent = PendingIntent.from_state_dict(state)
+                except Exception as exc:
+                    logger.warning(f"Skipping unrestorable intent: {exc}")
+                    continue
+                if not intent.is_active():
+                    continue
+                if len(self._intents) >= self.max_total:
+                    break
+                self._intents[intent.symbol] = intent
+                restored += 1
+        if restored:
+            logger.info(f"Restored {restored} pending intent(s) from disk")
+        return restored
 
     # ── Internal ─────────────────────────────────────────────
 

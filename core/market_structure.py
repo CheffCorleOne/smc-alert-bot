@@ -55,7 +55,63 @@ class CHoCHEvent:
 
 # ── Swing Point Detection ────────────────────────────────────
 
+# Bounded result cache. Swing detection is an O(n·bars) Python loop that is
+# re-run many times per scan (bias, liquidity, POI, confirmation, TP all detect
+# swings on the same frames). Caching by CONTENT hash keeps it correct (same
+# bars → same result) while avoiding the repeated recompute.
+_SWING_CACHE: "dict[tuple, List[SwingPoint]]" = {}
+_SWING_CACHE_MAX = 512
+
+
+def _swing_cache_key(df: pd.DataFrame, col: str, left_bars: int, right_bars: int):
+    if df is None or len(df) == 0:
+        return None
+    try:
+        # Price column is float64 -> tobytes() is a stable content hash.
+        # (Do NOT hash the tz-aware time column via tobytes: it becomes an
+        # object array of pointers and hashes differently each call.)
+        price_h = hash(df[col].to_numpy().tobytes())
+        first_ts = int(df["time"].iloc[0].value)
+        last_ts = int(df["time"].iloc[-1].value)
+    except Exception:
+        return None
+    return (col, len(df), price_h, first_ts, last_ts, left_bars, right_bars)
+
+
+def _cache_store(key, value):
+    if key is None:
+        return
+    if len(_SWING_CACHE) >= _SWING_CACHE_MAX:
+        # Simple eviction: drop an arbitrary (oldest-ish) entry.
+        _SWING_CACHE.pop(next(iter(_SWING_CACHE)), None)
+    _SWING_CACHE[key] = value
+
+
 def detect_swing_highs(
+    df: pd.DataFrame, left_bars: int = 3, right_bars: int = 3
+) -> List[SwingPoint]:
+    """Cached wrapper around the pivot-high detector (see _compute_swing_highs)."""
+    key = _swing_cache_key(df, "high", left_bars, right_bars)
+    if key is not None and key in _SWING_CACHE:
+        return _SWING_CACHE[key]
+    result = _compute_swing_highs(df, left_bars, right_bars)
+    _cache_store(key, result)
+    return result
+
+
+def detect_swing_lows(
+    df: pd.DataFrame, left_bars: int = 3, right_bars: int = 3
+) -> List[SwingPoint]:
+    """Cached wrapper around the pivot-low detector (see _compute_swing_lows)."""
+    key = _swing_cache_key(df, "low", left_bars, right_bars)
+    if key is not None and key in _SWING_CACHE:
+        return _SWING_CACHE[key]
+    result = _compute_swing_lows(df, left_bars, right_bars)
+    _cache_store(key, result)
+    return result
+
+
+def _compute_swing_highs(
     df: pd.DataFrame, left_bars: int = 3, right_bars: int = 3
 ) -> List[SwingPoint]:
     """
@@ -106,7 +162,7 @@ def detect_swing_highs(
     return swing_highs
 
 
-def detect_swing_lows(
+def _compute_swing_lows(
     df: pd.DataFrame, left_bars: int = 3, right_bars: int = 3
 ) -> List[SwingPoint]:
     """
@@ -281,16 +337,8 @@ def detect_choch(
     # Merge swings chronologically to track trend changes
     all_swings = sorted(swing_highs + swing_lows, key=lambda s: s.index)
 
-    # Track the key levels that would constitute a CHoCH
+    # Walk recent bars and flip the working trend each time a swing is broken.
     trend = current_trend
-    recent_swing_low = None
-    recent_swing_high = None
-
-    for swing in all_swings:
-        if swing.type == "high":
-            recent_swing_high = swing
-        else:
-            recent_swing_low = swing
 
     # Now scan for CHoCH in recent bars
     lookback = min(100, len(closes))
@@ -457,15 +505,41 @@ def _detect_trend_from_bos(
 
 # ── BOS After Sweep ──────────────────────────────────────────
 
+def recent_dealing_range(
+    swing_highs: List[SwingPoint],
+    swing_lows: List[SwingPoint],
+) -> Optional[Tuple[float, float]]:
+    """
+    Return (high, low) of the CURRENT dealing range for premium/discount.
+
+    ICT measures premium/discount from the most recent working swing leg, not
+    the all-time extremes of the lookback. Using global max/min skews the 50%
+    equilibrium and mislocates the OTE zone. We take the most recent confirmed
+    swing high and swing low (by bar index) and order them.
+
+    Returns None if there isn't at least one of each.
+    """
+    if not swing_highs or not swing_lows:
+        return None
+    last_sh = max(swing_highs, key=lambda s: s.index)
+    last_sl = max(swing_lows, key=lambda s: s.index)
+    hi = max(last_sh.price, last_sl.price)
+    lo = min(last_sh.price, last_sl.price)
+    if hi <= lo:
+        return None
+    return hi, lo
+
+
 def detect_bos_after_index(
     df: pd.DataFrame,
     after_index: int,
     expected_direction: str,
     left_bars: int = 2,
     right_bars: int = 1,
+    after_time: Optional[datetime] = None,
 ) -> Optional[BOSEvent]:
     """
-    Find a BOS event AFTER a given bar index in the expected direction.
+    Find a BOS event AFTER a given point in the expected direction.
 
     Used to confirm structural continuation after a liquidity sweep.
     For example, after sweeping SSL, we look for bullish BOS (price breaking
@@ -473,10 +547,13 @@ def detect_bos_after_index(
 
     Args:
         df: OHLCV DataFrame.
-        after_index: Only consider BOS events after this bar index.
+        after_index: Only consider BOS events after this bar index (per-``df``).
         expected_direction: 'bullish' or 'bearish'.
         left_bars: Swing detection sensitivity (left).
         right_bars: Swing detection sensitivity (right).
+        after_time: If given, filter by timestamp instead of index. REQUIRED
+            when the reference point (e.g. a sweep) was found on a *different*
+            timeframe — bar indices are not comparable across timeframes.
 
     Returns:
         The most recent matching BOSEvent, or None.
@@ -488,11 +565,16 @@ def detect_bos_after_index(
     sl = detect_swing_lows(df, left_bars, right_bars)
     bos_events = detect_bos(df, sh, sl)
 
-    # Find BOS after the sweep in the expected direction
-    matching = [
-        b for b in bos_events
-        if b.index > after_index and b.direction == expected_direction
-    ]
+    if after_time is not None:
+        matching = [
+            b for b in bos_events
+            if b.timestamp >= after_time and b.direction == expected_direction
+        ]
+    else:
+        matching = [
+            b for b in bos_events
+            if b.index > after_index and b.direction == expected_direction
+        ]
 
     return matching[-1] if matching else None
 
@@ -505,6 +587,7 @@ def detect_structure_shift(
     right_bars: int = 1,
     displacement_multiplier: float = 1.5,
     timeframes: Optional[List[str]] = None,
+    after_time: Optional[datetime] = None,
 ) -> Optional[dict]:
     """
     Unified multi-TF structure shift detection (CHoCH or BOS).
@@ -540,13 +623,21 @@ def detect_structure_shift(
         sh = detect_swing_highs(df, left_bars, right_bars)
         sl = detect_swing_lows(df, left_bars, right_bars)
 
-        # Check CHoCH first (stronger signal)
+        # Check CHoCH first (stronger signal). When a cross-timeframe reference
+        # point is supplied (after_time), filter chronologically by timestamp —
+        # bar indices from another timeframe are meaningless on this df.
         choch_events = detect_choch(df, sh, sl, current_trend, displacement_multiplier)
-        matching_choch = [
-            ch for ch in choch_events
-            if ch.direction == expected_direction
-            and (after_index == 0 or ch.index >= after_index)
-        ]
+        if after_time is not None:
+            matching_choch = [
+                ch for ch in choch_events
+                if ch.direction == expected_direction and ch.timestamp >= after_time
+            ]
+        else:
+            matching_choch = [
+                ch for ch in choch_events
+                if ch.direction == expected_direction
+                and (after_index == 0 or ch.index >= after_index)
+            ]
         
         # Prefer CHoCHs with displacement (MSS)
         if matching_choch:
@@ -565,7 +656,8 @@ def detect_structure_shift(
 
         # Check BOS as alternative (continuation confirmation)
         bos_event = detect_bos_after_index(
-            df, after_index, expected_direction, left_bars, right_bars
+            df, after_index, expected_direction, left_bars, right_bars,
+            after_time=after_time,
         )
         if bos_event:
             return {
@@ -638,6 +730,7 @@ def get_market_bias(
     right_bars: int = 3,
     min_bias_score: int = 3,
     strict: bool = True,
+    allow_weak_bias: bool = True,
 ) -> Tuple[str, str, int]:
     """
     Determine overall market bias from W1, D1, H4 structure.
@@ -703,7 +796,12 @@ def get_market_bias(
         confidence = "high" if score <= -(min_bias_score + 2) else "medium"
         return "bearish", confidence, score
 
-    # If alignment is mixed, keep a directional HTF draw using hierarchy.
+    # Alignment is weaker than min_bias_score. In strict ICT mode we refuse to
+    # invent a directional draw — no clean HTF bias means stand aside.
+    if not allow_weak_bias:
+        return "ranging", "low", score
+
+    # Otherwise keep a directional HTF draw using hierarchy (legacy behaviour).
     # W1 dominates, then D1, then H4. Score remains visible as confidence.
     for label in ("W1", "D1", "H4"):
         for tf_label, trend, _weight in tf_trends:

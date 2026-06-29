@@ -15,15 +15,7 @@ from utils.logger import get_logger
 
 logger = get_logger("connector")
 
-_mt5 = None
-
-
-def _get_mt5():
-    global _mt5
-    if _mt5 is None:
-        import MetaTrader5 as mt5
-        _mt5 = mt5
-    return _mt5
+from broker.mt5_client import get_mt5 as _get_mt5  # noqa: E402  (kept local alias)
 
 
 # ── Broker Detection Rules ──────────────────────────────────

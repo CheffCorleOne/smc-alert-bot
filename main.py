@@ -19,7 +19,6 @@ import sys
 import os
 import signal
 import webbrowser
-import threading
 import time
 import concurrent.futures
 from datetime import datetime, timezone, timedelta
@@ -72,7 +71,7 @@ bot_state: dict = {
 
 def _get_next_allowed_session(base_symbol: str, config: BotConfig, session_mgr: SessionManager) -> str:
     """Helper to determine the next upcoming allowed and active session/killzone for a symbol."""
-    from core.sessions import SESSIONS
+    from core.sessions import SESSIONS, NY_TZ
     
     allowed_kzs = session_mgr.get_session_for_instrument(base_symbol)
     if not allowed_kzs:
@@ -113,8 +112,8 @@ def _get_next_allowed_session(base_symbol: str, config: BotConfig, session_mgr: 
         "silver_bullet_ny": "Silver Bullet NY",
     }
 
-    now_time = datetime.now(timezone.utc).time()
-    
+    now_time = datetime.now(NY_TZ).time()  # killzone windows are NY-local
+
     # Calculate time until each session starts (in minutes)
     def minutes_until(start_time, current_time):
         curr_mins = current_time.hour * 60 + current_time.minute
@@ -522,12 +521,33 @@ def main() -> None:
         except Exception as exc:
             logger.warning(f"Could not load saved settings: {exc}")
 
+    # Secrets from environment / .env take precedence over the DB (12-factor).
+    try:
+        from utils.settings import load_secrets
+        secrets = load_secrets()
+        if secrets.telegram_token:
+            config.telegram_token = secrets.telegram_token
+        if secrets.telegram_chat_id:
+            config.telegram_chat_id = secrets.telegram_chat_id
+        if secrets.telegram_token or secrets.telegram_chat_id:
+            logger.info("Telegram credentials loaded from environment/.env")
+    except Exception as exc:
+        logger.warning(f"Could not load environment secrets: {exc}")
+
     connector = MT5Connector()
     fetcher = MarketDataFetcher()
     order_mgr = OrderManager(config, connector, db)
     risk_mgr = RiskManager(config, connector)
     entry_engine = SMCEntryEngine(config)
     news = NewsFilter()
+
+    # Restore any pending intents (incl. live limit-order setups) from the last
+    # run so a restart does not silently drop them.
+    if saved and isinstance(saved.get("_pending_intents"), list):
+        try:
+            entry_engine.intent_mgr.import_state(saved["_pending_intents"])
+        except Exception as exc:
+            logger.warning(f"Could not restore pending intents: {exc}")
 
     # Populate shared state
     bot_state["connector"] = connector
@@ -571,20 +591,13 @@ def main() -> None:
             )
             if auto_symbols:
                 # Merge into config.symbols without overwriting existing entries
+                # Merge newly discovered symbols without overwriting any name
+                # the user already configured (verify_symbols resolves those).
                 new_count = 0
                 for base_name, mt5_name in auto_symbols.items():
                     if base_name not in config.symbols:
                         config.symbols[base_name] = mt5_name
                         new_count += 1
-                    # Also resolve existing entries that might have wrong MT5 names
-                    elif config.symbols[base_name] != mt5_name:
-                        # Check if the configured name actually works
-                        existing_info = None
-                        try:
-                            mt5_mod = connector._get_mt5() if hasattr(connector, '_get_mt5') else _get_mt5_module()
-                        except Exception:
-                            mt5_mod = None
-                        # Keep existing mapping if it's already verified
 
                 logger.info(
                     f"Auto-load: {new_count} new symbols added, "
@@ -653,6 +666,10 @@ def main() -> None:
     def shutdown(sig=None, frame=None):
         logger.info("Shutting down...")
         bot_state["bot_running"] = False
+        try:
+            db.save_settings({"_pending_intents": entry_engine.intent_mgr.export_state()})
+        except Exception as exc:
+            logger.warning(f"Could not persist pending intents: {exc}")
         scheduler.shutdown(wait=False)
         connector.disconnect()
         db.log_event("info", "SMC Bot shutdown", category="system")

@@ -97,6 +97,20 @@ Use that number as `Telegram Chat ID`.
 
 Never commit your Telegram token to GitHub.
 
+## Configuration & Secrets (.env)
+
+Telegram credentials can be supplied via environment variables instead of the
+dashboard/database — this is the recommended way to keep secrets out of
+`data/bot_data.db`. Copy `.env.example` to `.env` and fill it in:
+
+```text
+TELEGRAM_TOKEN=123456:abc...
+TELEGRAM_CHAT_ID=123456789
+```
+
+`.env` is git-ignored. Values from the environment take precedence over anything
+saved in the database.
+
 ## How To Know It Is Working
 
 In the terminal you should see:
@@ -137,6 +151,13 @@ If Telegram is connected, the bot replies with active signals or `No active sign
 9. Signal: log setup, calculate advisory lot size, and notify Telegram.
 
 There is no maximum RR cap. RR is calculated from the structural entry, stop loss, and take profit found during analysis.
+
+### Analysis details
+
+- **Closed bars only.** The fetcher drops the current forming candle, so signals are evaluated on completed bars and do not repaint within a candle.
+- **DST-aware killzones.** Sessions are defined in New York local time (`America/New_York`) and shift automatically with US daylight saving — they are not hard-coded UTC windows.
+- **Quality scoring.** `setup_score` is a weighted blend of HTF-bias strength, structure-shift type (MSS > CHoCH > BOS), POI tightness vs ATR, sweep displacement, OTE location, and reward:risk — so `Min Setup Score` actually discriminates between setups.
+- **Premium/Discount** is measured from the current working swing leg (most recent swing high/low), not the all-time extremes of the lookback.
 
 ## Dashboard Settings
 
@@ -203,6 +224,7 @@ SMC ALERT BOT/
 |   |-- poi.py                 # OB, FVG, breaker, mitigation detection
 |   |-- sessions.py            # Killzone/session logic
 |-- broker/
+|   |-- mt5_client.py          # Single lazy MetaTrader5 accessor (get_mt5)
 |   |-- connector.py           # MT5 connection and symbol discovery
 |   |-- order_manager.py       # Read-only exposure/history helpers
 |   |-- risk_manager.py        # Lot sizing and daily statistics/limits
@@ -218,6 +240,17 @@ SMC ALERT BOT/
 |   |-- logger.py              # Logging helpers
 |   |-- news_filter.py         # News/event filter
 |   |-- config_snapshot.py     # Runtime config logging
+|   |-- indicators.py          # Shared ATR (single source of truth)
+|   |-- symbols.py             # normalize_symbol + pip-size registry
+|   |-- settings.py            # Env/.env secrets via pydantic-settings
+|-- backtest/
+|   |-- simulator.py           # Trade outcome + performance metrics
+|   |-- runner.py              # Walk-forward Backtester (no look-ahead)
+|   |-- run.py                 # CLI: py -m backtest.run SYMBOL
+|-- tests/                     # pytest suite (run: py -m pytest)
+|-- pyproject.toml             # ruff / mypy / pytest config
+|-- requirements-dev.txt       # Dev/test tooling
+|-- .env.example               # Template for Telegram secrets
 ```
 
 ## GitHub Safety Checklist
@@ -243,6 +276,42 @@ If `data/bot_data.db` was added by mistake:
 git rm --cached data/bot_data.db
 git commit -m "Remove local database from repo"
 ```
+
+## Development
+
+Install dev tooling and run the test suite:
+
+```powershell
+py -m pip install -r requirements-dev.txt
+py -m pytest          # ~99 tests, runs offline (MetaTrader5 is imported lazily)
+py -m ruff check .    # linting (advisory)
+```
+
+The SMC detectors are pure functions over pandas DataFrames, so the test suite
+runs without a live MT5 terminal.
+
+## Backtesting
+
+Replay the engine over historical MT5 data (terminal must be open & logged in):
+
+```powershell
+py -m backtest.run EURUSD --bars 50000 --cost-r 0.05
+```
+
+Useful flags:
+
+- `--bars` — how many M5 bars of history to load.
+- `--cost-r` — round-turn cost per trade in R (spread + commission + slippage).
+- `--max-hold-bars` — cap a trade's holding window in M5 bars (default 288 = 1 day). Without a cap, far take-profits "win" months later and inflate the results.
+
+The report includes win rate, expectancy (R), profit factor, max drawdown (R),
+and max consecutive losses.
+
+**Caveats:** a backtest does not guarantee future performance. The harness runs
+with the killzone/session filter relaxed (the engine's session check reads the
+wall clock, not the bar time), so results are optimistic versus the live bot,
+and entry fills are assumed at the signal price. Treat it as a sanity check of
+the logic, not a profit forecast.
 
 ## Disclaimer
 

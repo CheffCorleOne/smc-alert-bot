@@ -10,6 +10,15 @@ from dataclasses import dataclass, field, asdict
 from typing import List, Dict
 import json
 
+# Symbol normalisation / pip sizing live in utils.symbols (single source of
+# truth). Re-exported here so the long-standing `from config import get_pip_size`
+# imports across the codebase keep working unchanged.
+from utils.symbols import (  # noqa: F401
+    PIP_VALUES,
+    get_pip_size,
+    normalize_symbol,
+)
+
 INSTRUMENT_PROFILES: Dict[str, Dict] = {
     "XAUUSD": {
         "max_spread_pips": 50.0,
@@ -178,6 +187,8 @@ class BotConfig:
     min_setup_score: float = 55.0        # minimum score to execute
     min_bias_score: int = 2              # D1+H4 alignment is sufficient
     strict_pivot_bias: bool = False      # if False, uses BOS as trend confirmation fallback
+    require_aligned_htf_bias: bool = True  # ICT: stand aside when HTF bias is unclear
+                                           # (disables the weak hierarchy fallback in step 1)
 
     # ── Sessions (UTC) ───────────────────────────────────────
     trade_london_kz: bool = True
@@ -220,18 +231,12 @@ class BotConfig:
     @classmethod
     def from_dict(cls, data: dict) -> "BotConfig":
         """Create config from dictionary, ignoring unknown keys."""
+        # Only keep recognised fields; do NOT silently override user choices.
+        # (Previous versions force-raised min_bias_score>=3 and
+        # max_pending_intents>=15, which contradicted the dashboard and the
+        # per-instrument profiles. Respect what the user/profile sets.)
         valid_fields = {f.name for f in cls.__dataclass_fields__.values()}
         filtered = {k: v for k, v in data.items() if k in valid_fields}
-        if "min_bias_score" in filtered:
-            try:
-                filtered["min_bias_score"] = max(int(filtered["min_bias_score"]), 3)
-            except (TypeError, ValueError):
-                filtered["min_bias_score"] = 3
-        if "max_pending_intents" in filtered:
-            try:
-                filtered["max_pending_intents"] = max(int(filtered["max_pending_intents"]), 15)
-            except (TypeError, ValueError):
-                filtered["max_pending_intents"] = 15
         return cls(**filtered)
 
     @classmethod
@@ -261,103 +266,5 @@ class BotConfig:
         return names
 
 
-# ── Pip value helpers (used across modules) ──────────────────
-PIP_VALUES = {
-    # Forex — standard 4-digit pairs
-    "EURUSD": 0.0001,
-    "GBPUSD": 0.0001,
-    "AUDUSD": 0.0001,
-    "NZDUSD": 0.0001,
-    "USDCAD": 0.0001,
-    "USDCHF": 0.0001,
-    "EURGBP": 0.0001,
-    "EURAUD": 0.0001,
-    "EURNZD": 0.0001,
-    "EURCHF": 0.0001,
-    "EURCAD": 0.0001,
-    "GBPAUD": 0.0001,
-    "GBPNZD": 0.0001,
-    "GBPCAD": 0.0001,
-    "GBPCHF": 0.0001,
-    "AUDCAD": 0.0001,
-    "AUDNZD": 0.0001,
-    "AUDCHF": 0.0001,
-    "NZDCAD": 0.0001,
-    "NZDCHF": 0.0001,
-    "CADCHF": 0.0001,
-    # Forex — JPY pairs (2-digit)
-    "USDJPY": 0.01,
-    "GBPJPY": 0.01,
-    "EURJPY": 0.01,
-    "AUDJPY": 0.01,
-    "NZDJPY": 0.01,
-    "CADJPY": 0.01,
-    "CHFJPY": 0.01,
-    # Metals
-    "XAUUSD": 0.01,       # Gold: 1 pip = $0.01
-    "XAGUSD": 0.001,      # Silver
-    # Indices
-    "NAS100": 0.25,        # Nasdaq
-    "NQ": 0.25,            # Nasdaq alias (Libertex)
-    "USTEC": 0.25,         # Nasdaq alias (ICMarkets)
-    "US500": 0.25,         # S&P 500
-    "SP500": 0.25,         # S&P alias
-    "SPX500": 0.25,        # S&P alias
-    "US30": 1.0,           # Dow Jones
-    "DOW": 1.0,            # Dow alias
-    "DJ30": 1.0,           # Dow alias
-    "DAX": 0.1,            # German index
-    "GER40": 0.1,          # DAX alias
-    "GER30": 0.1,          # DAX alias
-    "UK100": 0.1,          # FTSE 100
-    "FTSE": 0.1,           # FTSE alias
-}
-
-
-def get_pip_size(symbol: str) -> float:
-    """Return pip size for a symbol. Uses known values, then heuristics."""
-    upper = symbol.upper()
-
-    # Strip common broker suffixes for lookup
-    clean = upper
-    for suffix in ("M", ".RAW", ".PRO", ".A", ".E", "#", ".I", "_SB", ".STD", ".ECN"):
-        if clean.endswith(suffix) and len(clean) > len(suffix) + 3:
-            clean = clean[:-len(suffix)]
-            break
-
-    # Direct match first
-    if clean in PIP_VALUES:
-        return PIP_VALUES[clean]
-
-    # Try partial match (e.g. "EURUSD" in "EURUSDm")
-    for key, val in PIP_VALUES.items():
-        if key in upper:
-            return val
-
-    # Heuristic: JPY pairs use 0.01
-    if "JPY" in upper:
-        return 0.01
-
-    # Heuristic: XAU/GOLD
-    if "XAU" in upper or "GOLD" in upper:
-        return 0.01
-
-    # Heuristic: XAG/SILVER
-    if "XAG" in upper or "SILVER" in upper:
-        return 0.001
-
-    # Heuristic: indices
-    for idx_key in ("NAS", "USTEC", "NDX", "US500", "SP500", "SPX"):
-        if idx_key in upper:
-            return 0.25
-    for idx_key in ("US30", "DOW", "DJ30"):
-        if idx_key in upper:
-            return 1.0
-    for idx_key in ("DAX", "GER"):
-        if idx_key in upper:
-            return 0.1
-    for idx_key in ("UK100", "FTSE"):
-        if idx_key in upper:
-            return 0.1
-
-    return 0.0001
+# Pip-size helpers (PIP_VALUES, get_pip_size, normalize_symbol) now live in
+# utils.symbols and are re-exported at the top of this module.

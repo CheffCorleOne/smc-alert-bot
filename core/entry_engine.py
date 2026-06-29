@@ -14,31 +14,22 @@ import pandas as pd
 
 from config import BotConfig, get_instrument_profile, get_pip_size
 from core.market_structure import (
-    detect_swing_highs, detect_swing_lows, detect_bos,
-    detect_choch, get_market_bias, SwingPoint,
-    detect_structure_shift, detect_bos_after_index,
+    detect_swing_highs, detect_swing_lows, detect_choch, get_market_bias, detect_structure_shift, detect_bos_after_index,
+    recent_dealing_range,
 )
 from core.liquidity import LiquidityEngine
-from core.poi import POIEngine, OrderBlock, FVG
+from core.poi import POIEngine, OrderBlock
 from core.premium_discount import (
     get_premium_discount_zones, is_in_discount,
     is_in_premium, is_in_ote,
 )
 from core.sessions import SessionManager
 from core.pending_intent import PendingIntent, IntentManager
+from broker.mt5_client import get_mt5
+from utils.indicators import atr as calculate_atr
 from utils.logger import get_logger
 
 logger = get_logger("entry")
-
-_mt5 = None
-
-
-def _get_mt5():
-    global _mt5
-    if _mt5 is None:
-        import MetaTrader5 as mt5
-        _mt5 = mt5
-    return _mt5
 
 
 # ── Signal Result ────────────────────────────────────────────
@@ -67,23 +58,6 @@ class AnalysisStep:
     passed: bool
     reason: str = ""
     data: Dict[str, Any] = field(default_factory=dict)
-
-
-def calculate_atr(df: pd.DataFrame, period: int = 14) -> float:
-    """Calculate Average True Range (ATR)."""
-    if df is None or len(df) < period + 1:
-        return 0.0
-    high = df["high"]
-    low = df["low"]
-    close_prev = df["close"].shift(1)
-
-    tr = pd.concat([
-        high - low,
-        (high - close_prev).abs(),
-        (low - close_prev).abs(),
-    ], axis=1).max(axis=1)
-    atr = tr.rolling(window=period).mean()
-    return float(atr.iloc[-1]) if not pd.isna(atr.iloc[-1]) else 0.0
 
 
 class SMCEntryEngine:
@@ -281,10 +255,19 @@ class SMCEntryEngine:
         # ── ALL STEPS PASSED → Build Signal ──
         is_sb = step6.data.get("is_silver_bullet", False)
         score = self.score_setup(
-            [s.name for s in steps if s.passed], is_kz,
-            liq_data=step2.data, direction=direction,
+            is_killzone=is_kz,
+            bias_score=int(step1.data.get("score", 0)),
+            shift_type=step4.data.get("shift_type", "choch"),
+            has_displacement=step4.data.get("has_displacement", False),
+            sweep_has_displacement=step3.data.get("sweep") is not None,
+            poi=poi,
+            atr_value=atr_value,
+            in_ote=step5.data.get("in_ote", False),
+            rr=rr,
             is_late_entry=step7.data.get("is_late_entry", False),
             is_silver_bullet=is_sb,
+            liq_data=step2.data,
+            direction=direction,
         )
 
         setup_parts = []
@@ -349,6 +332,7 @@ class SMCEntryEngine:
             rb,
             min_bias_score=min_bias_score,
             strict=getattr(self.config, "strict_pivot_bias", False),
+            allow_weak_bias=not getattr(self.config, "require_aligned_htf_bias", True),
         )
 
         if bias == "ranging":
@@ -597,29 +581,9 @@ class SMCEntryEngine:
 
         direction = "below" if "sell-side" in target_type else "above"
 
-        # Legacy Asian pre-check is disabled so every sweep must pass the
-        # same wick-close, displacement, and inducement filters.
-        if False and source == "asian_range":
-            asian = liq_data.get("asian_range", {})
-            if direction == "below" and asian.get("low_swept"):
-                # Asian Low already swept — this IS the Judas Swing
-                return AnalysisStep("sweep", True, data={
-                    "sweep_level": target_level,
-                    "sweep_direction": direction,
-                    "sweep": None,
-                    "timeframe": "H1",
-                    "sweep_type": "judas_swing",
-                    "asian_range": asian,
-                })
-            elif direction == "above" and asian.get("high_swept"):
-                return AnalysisStep("sweep", True, data={
-                    "sweep_level": target_level,
-                    "sweep_direction": direction,
-                    "sweep": None,
-                    "timeframe": "H1",
-                    "sweep_type": "judas_swing",
-                    "asian_range": asian,
-                })
+        # Note: Asian-range targets are NOT short-circuited here. Every sweep —
+        # including the Judas Swing on the Asian range — must pass the same
+        # wick-close, displacement, and (optional) inducement filters below.
 
         # --- Multi-Timeframe sweep detection (profile-driven) ---
         # Checking lower TFs captures intraday sweeps; indices can stay on H4/H1.
@@ -721,10 +685,15 @@ class SMCEntryEngine:
             expected_shift = "bullish"
             entry_direction = "buy"
 
-        after_idx = sweep_event.index if sweep_event else 0
-        # For judas swings, accept any recent shift
-        if sweep_type == "judas_swing":
-            after_idx = 0
+        # The structure shift must occur AFTER the sweep, chronologically. The
+        # sweep may have been found on a different timeframe than the CHoCH, so
+        # we anchor on its TIMESTAMP, not its bar index (indices differ per TF).
+        # For judas swings we accept any recent shift (after_time=None).
+        after_time = (
+            sweep_event.timestamp
+            if (sweep_event is not None and sweep_type != "judas_swing")
+            else None
+        )
 
         lb, rb = self._swing_params(symbol)
         choch_tfs = self._profile_list(symbol, "structure_tf", ["H1", "M15", "M5"])
@@ -732,7 +701,7 @@ class SMCEntryEngine:
         # --- Multi-TF CHoCH detection ---
         if self.config.multi_tf_choch:
             shift = detect_structure_shift(
-                data, expected_shift, after_index=after_idx,
+                data, expected_shift, after_index=0, after_time=after_time,
                 left_bars=lb, right_bars=rb,
                 displacement_multiplier=self.config.mss_displacement_multiplier,
                 timeframes=choch_tfs,
@@ -773,7 +742,7 @@ class SMCEntryEngine:
                         logger.debug(f"  [{symbol}] {expected_shift.upper()} CHoCH on H1 rejected: no displacement")
                         continue
 
-                    if sweep_type == "judas_swing" or (sweep_event and ch.index >= sweep_event.index):
+                    if sweep_type == "judas_swing" or after_time is None or ch.timestamp >= after_time:
                         return AnalysisStep("choch", True, data={
                             "choch": ch,
                             "entry_direction": entry_direction,
@@ -784,7 +753,7 @@ class SMCEntryEngine:
             # --- BOS as alternative to CHoCH ---
             if self.config.use_bos_as_entry:
                 bos = detect_bos_after_index(
-                    df_h1, after_idx, expected_shift, lb, rb
+                    df_h1, 0, expected_shift, lb, rb, after_time=after_time
                 )
                 if bos:
                     return AnalysisStep("choch", True, data={
@@ -820,13 +789,14 @@ class SMCEntryEngine:
             if df is None or len(df) < 20:
                 continue
 
-            # Get premium/discount zones
+            # Premium/discount zones from the CURRENT working swing leg
+            # (most recent swing high/low), not the global lookback extremes.
             sh = detect_swing_highs(df, lb, rb)
             sl = detect_swing_lows(df, lb, rb)
-            if sh and sl:
-                highest = max(s.price for s in sh)
-                lowest = min(s.price for s in sl)
-                zones = get_premium_discount_zones(highest, lowest)
+            dealing_range = recent_dealing_range(sh, sl)
+            if dealing_range:
+                hi, lo = dealing_range
+                zones = get_premium_discount_zones(hi, lo)
             else:
                 zones = {}
 
@@ -853,7 +823,7 @@ class SMCEntryEngine:
                         best_poi = valid_fvgs[-1]
                         poi_type = f"Bullish FVG on {tf}"
                     else:
-                        poi_type += f" + FVG"
+                        poi_type += " + FVG"
 
                 # Breaker blocks as fallback POI
                 if best_poi is None and self.config.use_breaker_blocks:
@@ -912,7 +882,7 @@ class SMCEntryEngine:
                         best_poi = valid_fvgs[-1]
                         poi_type = f"Bearish FVG on {tf}"
                     else:
-                        poi_type += f" + FVG"
+                        poi_type += " + FVG"
 
                 # Breaker blocks as fallback POI
                 if best_poi is None and self.config.use_breaker_blocks:
@@ -963,6 +933,7 @@ class SMCEntryEngine:
             "poi": best_poi, "poi_type": poi_type,
             "has_ob": has_ob, "has_fvg": has_fvg,
             "ce_level": round(ce_level, 5),
+            "in_ote": bool(zones) and is_in_ote(ce_level, zones),
         })
 
     def _step6_session(self, symbol: str) -> AnalysisStep:
@@ -1310,7 +1281,7 @@ class SMCEntryEngine:
 
         # 5. Reject trades that violate broker minimum stop distance.
         try:
-            mt5 = _get_mt5()
+            mt5 = get_mt5()
             mt5_symbol = self.config.get_mt5_symbol(symbol)
             sym_info = mt5.symbol_info(mt5_symbol)
             if sym_info is not None:
@@ -1372,35 +1343,99 @@ class SMCEntryEngine:
 
     # ── Scoring ──────────────────────────────────────────────
 
+    # Quality-factor weights (sum = 100). Tunable; these drive setup_score so
+    # that min_setup_score / min_limit_setup_score actually discriminate.
+    QUALITY_WEIGHTS = {
+        "htf_bias": 18,    # strength/alignment of the HTF draw
+        "structure": 20,   # CHoCH+displacement (MSS) > CHoCH > BOS
+        "poi": 18,         # tighter POI relative to ATR scores higher
+        "sweep": 14,       # sweep with displacement is cleaner
+        "location": 12,    # POI inside OTE (0.62–0.79) is premium location
+        "rr": 18,          # reward:risk, saturating at ~3R
+    }
+    # Reference ceilings used to normalise raw factor values to 0..1.
+    _BIAS_SCORE_CEIL = 6.0
+    _POI_WIDTH_ATR_CEIL = 1.5
+    _RR_CEIL = 3.0
+
     def score_setup(
-        self, steps_passed: List[str], is_killzone: bool = False,
-        liq_data: Optional[Dict] = None, direction: str = "",
-        is_late_entry: bool = False, is_silver_bullet: bool = False,
+        self,
+        *,
+        is_killzone: bool = False,
+        bias_score: int = 0,
+        shift_type: str = "choch",
+        has_displacement: bool = False,
+        sweep_has_displacement: bool = True,
+        poi: Any = None,
+        atr_value: float = 0.0,
+        in_ote: bool = False,
+        rr: float = 0.0,
+        is_late_entry: bool = False,
+        is_silver_bullet: bool = False,
+        liq_data: Optional[Dict] = None,
+        direction: str = "",
     ) -> float:
         """
-        Calculate setup quality score (0–100) from weighted steps.
+        Weighted setup-quality score (0–100) from real confluence factors.
 
-        Bonuses:
-        - Killzone: +20
-        - Midnight Open confluence: +5 (buying in Discount or selling in Premium)
-        - Asian Range + EQH/EQL confluence: +5
-
-        Weights: htf_bias=25, liquidity=20, sweep=20, choch=15, poi_zone=20.
-        Max base score is 100.
+        Unlike the previous "all steps passed → 100" model, this rewards the
+        *quality* of each confluence so the score is discriminating:
+          - HTF bias strength (|score| toward ±6)
+          - structure shift type (MSS > CHoCH > BOS)
+          - POI tightness vs ATR (narrow zones are higher conviction)
+          - sweep displacement
+          - location (inside OTE)
+          - reward:risk, saturating at ~3R
+        Modifiers: killzone gate, Silver Bullet bonus, late-entry penalty,
+        Midnight-Open confluence bonus.
         """
-        total_weight = sum(self.WEIGHTS.values())
-        earned = sum(self.WEIGHTS.get(s, 0) for s in steps_passed)
-        score = (earned / total_weight) * 100 if total_weight > 0 else 0
+        w = self.QUALITY_WEIGHTS
 
-        if is_killzone:
-            score += 20.0
+        def clamp01(x: float) -> float:
+            return max(0.0, min(1.0, x))
+
+        # 1. HTF bias strength
+        bias_q = clamp01(abs(bias_score) / self._BIAS_SCORE_CEIL)
+
+        # 2. Structure shift quality
+        if shift_type == "choch" and has_displacement:
+            struct_q = 1.0
+        elif shift_type == "choch":
+            struct_q = 0.7
+        else:  # bos
+            struct_q = 0.5
+
+        # 3. POI tightness (narrower POI relative to ATR = better)
+        if poi is not None and atr_value > 0 and hasattr(poi, "top"):
+            width_atr = abs(poi.top - poi.bottom) / atr_value
+            poi_q = clamp01(1.0 - width_atr / self._POI_WIDTH_ATR_CEIL)
         else:
-            # Penalty for trading outside killzone
-            score -= float(getattr(self.config, 'outside_kz_score_penalty', 15.0))
+            poi_q = 0.6  # unknown width — neutral-ish
+
+        # 4. Sweep displacement
+        sweep_q = 1.0 if sweep_has_displacement else 0.6
+
+        # 5. Location — inside OTE is premium
+        location_q = 1.0 if in_ote else 0.6
+
+        # 6. Reward:risk, saturating
+        rr_q = clamp01(rr / self._RR_CEIL)
+
+        score = (
+            bias_q * w["htf_bias"]
+            + struct_q * w["structure"]
+            + poi_q * w["poi"]
+            + sweep_q * w["sweep"]
+            + location_q * w["location"]
+            + rr_q * w["rr"]
+        )
+
+        # ── Modifiers ────────────────────────────────────────────
+        if not is_killzone:
+            score -= float(getattr(self.config, "outside_kz_score_penalty", 15.0))
 
         if is_silver_bullet:
             score += 5.0
-            logger.debug("  +5 Silver Bullet session bonus")
 
         if is_late_entry:
             score -= float(getattr(self.config, "late_entry_score_penalty", 10.0))
@@ -1411,15 +1446,10 @@ class SMCEntryEngine:
             mo = asian.get("midnight_open")
             target = liq_data.get("target_level")
             if mo and target:
-                if direction == "buy" and target < mo:
-                    # Buying below Midnight Open = Discount zone → good
+                if (direction == "buy" and target < mo) or (direction == "sell" and target > mo):
                     score += 5.0
-                    logger.debug("  +5 Midnight Open confluence (buying in Discount)")
-                elif direction == "sell" and target > mo:
-                    score += 5.0
-                    logger.debug("  +5 Midnight Open confluence (selling in Premium)")
 
-        return min(100.0, score)
+        return max(0.0, min(100.0, score))
 
     def _find_structural_tp(
         self, data: Optional[Dict], direction: str,
@@ -1616,14 +1646,23 @@ class SMCEntryEngine:
                     # Calculate ATR from the instrument profile timeframe.
                     atr_value = self._profile_atr(data, symbol)
                         
-                    # Calculate setup score based on steps 1-6
-                    steps_passed = ["htf_bias", "liquidity", "sweep", "choch", "poi_zone", "session"]
+                    # Quality score for the limit decision. RR is not known yet
+                    # (step8 runs only if we approve), so use the instrument's
+                    # minimum RR as a conservative placeholder for the rr factor.
                     is_kz = step6.data.get("is_killzone", False)
                     is_sb = step6.data.get("is_silver_bullet", False)
+                    placeholder_rr = float(self._profile(symbol).get("min_rr", self.config.min_rr))
                     setup_score = self.score_setup(
-                        steps_passed, is_kz,
-                        liq_data=liq_data, direction=direction,
-                        is_late_entry=False, is_silver_bullet=is_sb
+                        is_killzone=is_kz,
+                        bias_score=int(step1.data.get("score", 0)),
+                        shift_type=getattr(intent, "choch_direction", "") or "choch",
+                        poi=poi,
+                        atr_value=atr_value,
+                        in_ote=step5.data.get("in_ote", False),
+                        rr=placeholder_rr,
+                        is_silver_bullet=is_sb,
+                        liq_data=liq_data,
+                        direction=direction,
                     )
                     
                     # Call algorithmic decision helper
@@ -1704,6 +1743,19 @@ class SMCEntryEngine:
             rr = step8.data["rr"]
             kz_name = step6.data.get("session", "Intent")
 
+            setup_score = self.score_setup(
+                is_killzone=step6.data.get("is_killzone", False),
+                bias_score=int(step1.data.get("score", 0)),
+                shift_type=getattr(intent, "choch_direction", "") or "choch",
+                poi=poi,
+                atr_value=atr_value,
+                in_ote=step5.data.get("in_ote", False),
+                rr=rr,
+                is_silver_bullet=step6.data.get("is_silver_bullet", False),
+                liq_data=liq_data,
+                direction=direction,
+            )
+
             signal = SignalResult(
                 symbol=symbol,
                 direction=direction,
@@ -1711,11 +1763,11 @@ class SMCEntryEngine:
                 sl_price=round(sl_price, 5),
                 tp_price=round(tp_price, 5),
                 rr_ratio=round(rr, 2),
-                setup_score=90.0,  # Intent-triggered setups are high-conviction
+                setup_score=round(setup_score, 1),
                 setup_type=f"Intent {intent.poi_type or 'Setup'}",
                 session=kz_name,
                 timestamp=datetime.now(timezone.utc),
-                confidence="high",
+                confidence="high" if setup_score >= 80 else "medium",
                 steps_log={"source": "PendingIntent", "narrative": intent.narrative},
             )
 

@@ -1,0 +1,49 @@
+[project]
+name = "smc-alert-bot"
+version = "0.1.0"
+description = "Smart Money Concepts (ICT/SMC) signal notifier for MetaTrader 5."
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-q"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+# MT5 + dashboard code is third-party heavy; keep scope to our own packages.
+extend-exclude = ["__pycache__", "data/*.db", "logs"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes (unused imports/vars, undefined names)
+    "I",    # isort
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "SIM",  # flake8-simplify
+]
+ignore = [
+    "E501",  # line length handled by formatter, not enforced hard
+    "B008",  # function call in default arg (used intentionally in some dataclasses)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B", "SIM"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true   # MetaTrader5, dash, telegram have no stubs
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+# Start lenient; tighten module-by-module as the refactor lands.
+check_untyped_defs = false
+disallow_untyped_defs = false
+exclude = ["dashboard/", "tests/"]

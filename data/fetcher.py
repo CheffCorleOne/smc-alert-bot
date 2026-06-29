@@ -6,7 +6,6 @@ Provides cached multi-timeframe market data for the SMC analysis engine.
 
 import time
 import threading
-from datetime import datetime, timezone
 from typing import Dict, Optional
 
 import pandas as pd
@@ -15,20 +14,8 @@ from utils.logger import get_logger
 
 logger = get_logger("fetcher")
 
-# Lazy import MT5 — may not be available on all platforms
-_mt5 = None
-
-
-def _get_mt5():
-    global _mt5
-    if _mt5 is None:
-        try:
-            import MetaTrader5 as mt5
-            _mt5 = mt5
-        except ImportError:
-            logger.error("MetaTrader5 package not installed")
-            raise
-    return _mt5
+# Lazy MT5 accessor (Windows-only). Centralised in broker.mt5_client.
+from broker.mt5_client import get_mt5 as _get_mt5  # noqa: E402  (kept local alias)
 
 
 # Timeframe name → MT5 constant mapping
@@ -84,7 +71,8 @@ class MarketDataFetcher:
             return (time.time() - entry["timestamp"]) < ttl
 
     def get_ohlcv(
-        self, symbol: str, timeframe: str, bars: int = 500
+        self, symbol: str, timeframe: str, bars: int = 500,
+        drop_forming: bool = True,
     ) -> Optional[pd.DataFrame]:
         """
         Fetch OHLCV data for a symbol and timeframe.
@@ -92,7 +80,11 @@ class MarketDataFetcher:
         Args:
             symbol: MT5 symbol name (e.g. 'EURUSD', 'EURUSDm').
             timeframe: One of M1, M5, M15, M30, H1, H4, D1, W1.
-            bars: Number of bars to fetch.
+            bars: Number of *closed* bars to return.
+            drop_forming: Drop the most recent, still-forming candle. SMC
+                analysis must act on CLOSED bars only — keeping the live bar
+                causes signals to repaint within the candle. We therefore fetch
+                one extra bar and discard the last (open) one.
 
         Returns:
             DataFrame with columns: time, open, high, low, close, volume.
@@ -108,7 +100,8 @@ class MarketDataFetcher:
         try:
             mt5 = _get_mt5()
             tf_const = getattr(mt5, TF_MAP.get(timeframe, "TIMEFRAME_M15"))
-            rates = mt5.copy_rates_from_pos(symbol, tf_const, 0, bars)
+            fetch_n = bars + 1 if drop_forming else bars
+            rates = mt5.copy_rates_from_pos(symbol, tf_const, 0, fetch_n)
 
             if rates is None or len(rates) == 0:
                 err = mt5.last_error()
@@ -122,6 +115,11 @@ class MarketDataFetcher:
             df = df[["time", "open", "high", "low", "close",
                       "tick_volume"]].copy()
             df.rename(columns={"tick_volume": "volume"}, inplace=True)
+
+            # Anti-repaint: the last bar from MT5 is the current forming candle.
+            if drop_forming and len(df) > 1:
+                df = df.iloc[:-1]
+
             df.reset_index(drop=True, inplace=True)
 
             # Cache it
