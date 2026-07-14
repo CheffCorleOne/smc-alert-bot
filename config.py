@@ -164,6 +164,7 @@ class BotConfig:
 
     # ── Entry Refinements ────────────────────────────────────
     require_inducement: bool = False         # require inducement before sweep
+    require_sweep_displacement: bool = False # require displacement after sweep
     use_bos_as_entry: bool = True            # accept BOS (not only CHoCH) for entry
     multi_tf_choch: bool = True              # check M15+M5 for CHoCH cascade
     require_mss_displacement: bool = False   # require strong impulse for MSS (was True)
@@ -196,6 +197,7 @@ class BotConfig:
     trade_london_close: bool = True
     trade_asian_kz: bool = True
     use_silver_bullet: bool = True       # Enable Silver Bullet entry logic
+    ignore_weekend_filter: bool = False  # backtest-only: ignore wall-clock weekend gate
 
     # ── Asian Range / ICT Power of 3 ─────────────────────────
     use_asian_range: bool = True          # Enable Asian Range as liquidity source

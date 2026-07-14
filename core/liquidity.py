@@ -45,6 +45,7 @@ class SweepEvent:
     close: float            # Close of the sweep candle
     timestamp: datetime
     penetration: float      # How far price went beyond the level
+    has_displacement: bool = False
 
 
 class LiquidityEngine:
@@ -278,8 +279,8 @@ class LiquidityEngine:
         atr = self._calculate_atr(df)
 
         def has_displacement(sweep_index: int) -> bool:
-            if not require_displacement or atr <= 0:
-                return True
+            if atr <= 0:
+                return False
 
             end = min(len(df), sweep_index + displacement_window + 1)
             for j in range(sweep_index + 1, end):
@@ -292,10 +293,15 @@ class LiquidityEngine:
                     return True
             return False
 
+        def passes_displacement(sweep_index: int) -> tuple[bool, bool]:
+            displaced = has_displacement(sweep_index)
+            return (displaced or not require_displacement), displaced
+
         for i in range(start, len(df)):
             if direction == "above":
                 # Standard single-candle sweep: Wick went above level, but close came back below
-                if highs[i] > level and closes[i] < level and has_displacement(i):
+                passes, displaced = passes_displacement(i)
+                if highs[i] > level and closes[i] < level and passes:
                     penetration = highs[i] - level
                     return SweepEvent(
                         index=i,
@@ -306,14 +312,16 @@ class LiquidityEngine:
                         close=closes[i],
                         timestamp=pd.Timestamp(times[i]).to_pydatetime(),
                         penetration=round(penetration, 5),
+                        has_displacement=displaced,
                     )
                 # Two-candle sweep: previous candle broke level, current candle closed below it
-                elif (
+                passes, displaced = passes_displacement(i)
+                if (
                     i > 0
                     and highs[i - 1] > level
                     and closes[i] < level
                     and highs[i] <= highs[i - 1]
-                    and has_displacement(i)
+                    and passes
                 ):
                     penetration = highs[i-1] - level
                     return SweepEvent(
@@ -325,10 +333,12 @@ class LiquidityEngine:
                         close=closes[i],
                         timestamp=pd.Timestamp(times[i]).to_pydatetime(),
                         penetration=round(penetration, 5),
+                        has_displacement=displaced,
                     )
             elif direction == "below":
                 # Standard single-candle sweep
-                if lows[i] < level and closes[i] > level and has_displacement(i):
+                passes, displaced = passes_displacement(i)
+                if lows[i] < level and closes[i] > level and passes:
                     penetration = level - lows[i]
                     return SweepEvent(
                         index=i,
@@ -339,14 +349,16 @@ class LiquidityEngine:
                         close=closes[i],
                         timestamp=pd.Timestamp(times[i]).to_pydatetime(),
                         penetration=round(penetration, 5),
+                        has_displacement=displaced,
                     )
                 # Two-candle sweep
-                elif (
+                passes, displaced = passes_displacement(i)
+                if (
                     i > 0
                     and lows[i - 1] < level
                     and closes[i] > level
                     and lows[i] >= lows[i - 1]
-                    and has_displacement(i)
+                    and passes
                 ):
                     penetration = level - lows[i-1]
                     return SweepEvent(
@@ -358,6 +370,7 @@ class LiquidityEngine:
                         close=closes[i],
                         timestamp=pd.Timestamp(times[i]).to_pydatetime(),
                         penetration=round(penetration, 5),
+                        has_displacement=displaced,
                     )
 
         return None

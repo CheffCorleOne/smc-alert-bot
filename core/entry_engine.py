@@ -259,7 +259,7 @@ class SMCEntryEngine:
             bias_score=int(step1.data.get("score", 0)),
             shift_type=step4.data.get("shift_type", "choch"),
             has_displacement=step4.data.get("has_displacement", False),
-            sweep_has_displacement=step3.data.get("sweep") is not None,
+            sweep_has_displacement=step3.data.get("sweep_has_displacement", False),
             poi=poi,
             atr_value=atr_value,
             in_ote=step5.data.get("in_ote", False),
@@ -583,7 +583,7 @@ class SMCEntryEngine:
 
         # Note: Asian-range targets are NOT short-circuited here. Every sweep —
         # including the Judas Swing on the Asian range — must pass the same
-        # wick-close, displacement, and (optional) inducement filters below.
+        # wick-close and optional displacement/inducement filters below.
 
         # --- Multi-Timeframe sweep detection (profile-driven) ---
         # Checking lower TFs captures intraday sweeps; indices can stay on H4/H1.
@@ -600,7 +600,7 @@ class SMCEntryEngine:
                 target_level,
                 direction,
                 lookback=lb_val,
-                require_displacement=True,
+                require_displacement=getattr(self.config, "require_sweep_displacement", False),
                 displacement_atr_multiple=disp_atr,
                 displacement_window=3,
             )
@@ -615,6 +615,7 @@ class SMCEntryEngine:
                     "sweep_level": target_level,
                     "sweep_direction": direction,
                     "sweep": sweep,
+                    "sweep_has_displacement": getattr(sweep, "has_displacement", False),
                     "timeframe": tf,
                     "sweep_type": "judas_swing" if source == "asian_range" else "standard",
                     "asian_range": liq_data.get("asian_range"),
@@ -939,6 +940,12 @@ class SMCEntryEngine:
     def _step6_session(self, symbol: str) -> AnalysisStep:
         """STEP 6: Check session and time filters."""
         if self.session_mgr.is_weekend():
+            if getattr(self.config, "ignore_weekend_filter", False):
+                return AnalysisStep("session", True, data={
+                    "session": "Backtest",
+                    "is_killzone": False,
+                    "is_silver_bullet": False,
+                })
             return AnalysisStep("session", False, "Weekend — market closed")
 
         session_name = self.session_mgr.get_current_session()
@@ -1535,6 +1542,7 @@ class SMCEntryEngine:
             liquidity_target=steps_data.get("liquidity_target"),
             liquidity_type=steps_data.get("liquidity_type", ""),
             sweep_level=steps_data.get("sweep_level"),
+            sweep_has_displacement=steps_data.get("sweep_has_displacement", False),
         )
 
         # If we have POI data and limit orders are enabled, store POI for limit order
@@ -1588,6 +1596,7 @@ class SMCEntryEngine:
             if not step3.passed:
                 return None
             intent.sweep_level = step3.data.get("sweep_level")
+            intent.sweep_has_displacement = step3.data.get("sweep_has_displacement", False)
             intent.waiting_for = "choch"
             intent.waiting_detail = "Sweep confirmed! Waiting for CHoCH/BOS"
             intent.advance_phase("ready", "Sweep detected")
@@ -1661,6 +1670,7 @@ class SMCEntryEngine:
                         in_ote=step5.data.get("in_ote", False),
                         rr=placeholder_rr,
                         is_silver_bullet=is_sb,
+                        sweep_has_displacement=getattr(intent, "sweep_has_displacement", False),
                         liq_data=liq_data,
                         direction=direction,
                     )
@@ -1752,6 +1762,7 @@ class SMCEntryEngine:
                 in_ote=step5.data.get("in_ote", False),
                 rr=rr,
                 is_silver_bullet=step6.data.get("is_silver_bullet", False),
+                sweep_has_displacement=getattr(intent, "sweep_has_displacement", False),
                 liq_data=liq_data,
                 direction=direction,
             )

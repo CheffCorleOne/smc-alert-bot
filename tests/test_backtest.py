@@ -101,6 +101,11 @@ class TestMetrics:
 
 
 class TestBacktesterSmoke:
+    def test_ignore_sessions_bypasses_wall_clock_weekend(self):
+        bt = Backtester("EURUSD", ignore_sessions=True)
+        assert bt.config.allow_outside_killzone is True
+        assert bt.config.ignore_weekend_filter is True
+
     def test_runs_without_error(self):
         # Flat-ish synthetic history across all TFs; we only assert it executes
         # and returns a well-formed metrics dict (signals likely 0).

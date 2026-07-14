@@ -42,6 +42,7 @@ class Backtester:
         if ignore_sessions:
             # Relax the wall-clock killzone gate so structure logic is testable.
             self.config.allow_outside_killzone = True
+            self.config.ignore_weekend_filter = True
             self.config.outside_kz_score_penalty = 0.0
         self.engine = SMCEntryEngine(self.config)
         self.step = max(1, step)

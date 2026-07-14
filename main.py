@@ -391,6 +391,7 @@ def _analyze_single_symbol(base_symbol: str) -> None:
                         if step3.passed:
                             steps_data["sweep_level"] = step3.data.get("sweep_level")
                             steps_data["sweep"] = step3.data.get("sweep")
+                            steps_data["sweep_has_displacement"] = step3.data.get("sweep_has_displacement", False)
                             steps_data["sweep_type"] = step3.data.get("sweep_type", "standard")
                             
                             if step > 4:

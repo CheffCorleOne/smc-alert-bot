@@ -70,6 +70,7 @@ class PendingIntent:
     liquidity_target: Optional[float] = None
     liquidity_type: str = ""               # e.g. "EQL (sell-side)"
     sweep_level: Optional[float] = None
+    sweep_has_displacement: bool = False
     choch_direction: str = ""              # 'bullish' or 'bearish'
     poi_top: Optional[float] = None
     poi_bottom: Optional[float] = None
@@ -166,7 +167,7 @@ class PendingIntent:
     _STATE_FIELDS = (
         "symbol", "direction", "htf_bias", "narrative", "phase",
         "waiting_for", "waiting_detail", "liquidity_target", "liquidity_type",
-        "sweep_level", "choch_direction", "poi_top", "poi_bottom", "poi_type",
+        "sweep_level", "sweep_has_displacement", "choch_direction", "poi_top", "poi_bottom", "poi_type",
         "limit_entry", "limit_sl", "limit_tp", "limit_ticket",
     )
 

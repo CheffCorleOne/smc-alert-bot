@@ -34,6 +34,12 @@ class TestFromDict:
         cfg = BotConfig.from_dict({"max_pending_intents": 2})
         assert cfg.max_pending_intents == 2
 
+    def test_sweep_displacement_default_is_permissive(self):
+        assert BotConfig().require_sweep_displacement is False
+
+    def test_weekend_filter_default_is_live_safe(self):
+        assert BotConfig().ignore_weekend_filter is False
+
     def test_unknown_keys_ignored(self):
         cfg = BotConfig.from_dict({"totally_unknown": 5, "risk_per_trade_pct": 2.0})
         assert cfg.risk_per_trade_pct == 2.0
